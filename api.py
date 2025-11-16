@@ -277,7 +277,7 @@ except LookupError:
     SIA = None
 
 @app.get("/search")
-async def search(width: int, height: int, phrase: str = "angry", mode: str = "search", n: int = 10, pos: list[int] = Query(None)):
+async def search(width: int, height: int, phrase: str = "angry", mode: str = "search", n: int = 10, pos: list[str] = Query(None)):
     if not SIA: return JSONResponse({"error": "NLTK VADER lexicon not initialized on server."}, 500)
 
     query_phrase = phrase
