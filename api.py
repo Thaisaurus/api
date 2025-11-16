@@ -1,27 +1,51 @@
-import requests
+from fastapi.responses import JSONResponse
 import numpy as np
 import os
-from qdrant_client import QdrantClient, models
+from qdrant_client import AsyncQdrantClient, models
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from functools import lru_cache
 from nltk.corpus import wordnet as wn
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+import asyncio
+import httpx
+import traceback
+from async_lru import alru_cache
 
-instruct_chat_endpoint = "http://127.0.0.1:8081/v1/chat/completions"
-embedding_endpoint = "http://127.0.0.1:8080/embedding"
-qdrant_host = "localhost"
-qdrant_port = 6333
-qdrant_collection = "thaisaurus-wordnet-qwen3embedding-nofallback-notags"#final-v1
+
+# env, default or quit
+def edq(key: str, default: str | None):
+    v = os.getenv(key) or default
+    if not v:
+        print(f"missing env var {key}")
+        exit(1)
+    return v
+
+instruct_chat_endpoint = edq("ENDPOINT_CHAT", "https://openrouter.ai/api/v1/chat/completions")
+embedding_endpoint = edq("ENDPOINT_EMBEDDING", "https://openrouter.ai/api/v1/embeddings")
+llm_model = edq("MODEL", "openai/gpt-oss-20b")
+openrouter_api_key = edq("OPENROUTER_API_KEY", None)
+qdrant_host = edq("QDRANT_HOST", "localhost")
+qdrant_collection = edq("QDRANT_COLLECTION", "thaisaurus-wordnet-qwen3embedding-nofallback-notags") #final-v1
+qdrant_api_key = edq("QDRANT_API_KEY", None)
+
+http_client = httpx.AsyncClient(http2=True, headers={"Content-Type": "application/json", "Authorization": f"Bearer {openrouter_api_key}"})
+
+qdrant_client = AsyncQdrantClient(
+    host=qdrant_host,
+    port=6333,
+    api_key=qdrant_api_key,
+    https=False,
+)
 
 prompt_modes = {
     "synonym": {
-        "system": "You are an expert lexicographer. Your task is to write a single, concise sentence that describes the core meaning of a concept. Your response must be ONLY the single descriptive sentence, no markdown, no part of speech, no pronunciation, no examples, only the meaning.",
+        "system": "You are an expert lexicographer. Your task is to write one or two concise sentences that describes the core meaning of a concept. Your response must be ONLY the descriptive sentence(s), no markdown, no part of speech, no pronunciation, no examples, only the meaning.",
         "user": "Input: '{}'"
     },
     "antonym": {
-        "system": "You are an expert lexicographer. Your task is to write a single, concise sentence that describes the core meaning of the OPPOSITE of a concept. Your response must be ONLY the single descriptive sentence, no markdown, no part of speech, no pronunciation, no examples, only the OPPOSITE meaning.",
+        "system": "You are an expert lexicographer. Your task is to write one or two concise sentences that describes the core meaning of the OPPOSITE of a concept. Your response must be ONLY the descriptive sentence(s), no markdown, no part of speech, no pronunciation, no examples, only the OPPOSITE meaning.",
         "user": "Describe the opposite concept of: '{}'"
     }
 }
@@ -31,47 +55,50 @@ def normalize_l2(x):
     norm = np.linalg.norm(x)
     return x / norm if norm > 0 else x
 
-@lru_cache(maxsize=2048)
-def generate_query_definition(word: str, mode: str) -> str:
+@alru_cache(maxsize=2048)
+async def generate_query_definition(word: str, mode: str) -> str:
     prompt_template = prompt_modes.get(mode)
     if not prompt_template:
         raise ValueError(f"invalid mode: {mode}")
 
     payload = {
+        "model": llm_model,
         "messages": [
             {"role": "system", "content": prompt_template["system"]},
             {"role": "user", "content": prompt_template["user"].format(word)}
         ],
+        "extra_body": {"reasoning": {"enabled": False}},
         "stream": False, "temperature": 0.1, "n_predict": 128
     }
     try:
-        response = requests.post(instruct_chat_endpoint, json=payload, timeout=60)
+        response = await http_client.post(instruct_chat_endpoint, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
         return data['choices'][0]['message']['content'].strip()
-    except requests.exceptions.RequestException as e:
+    except httpx.RequestError as e:
         print(f"error connecting to chat completion server: {e}")
         return None
 
-@lru_cache(maxsize=2048)
-def get_query_embedding(text_definition: str) -> list:
-    payload = {"input": text_definition}
+@alru_cache(maxsize=2048)
+async def get_query_embedding(text_definition: str) -> list:
+    payload = {"input": text_definition, "model": "qwen/qwen3-embedding-4b", "encoding_format": "float"}
     try:
-        response = requests.post(embedding_endpoint, json=payload, timeout=30)
+        response = await http_client.post(embedding_endpoint, json=payload, timeout=30)
         response.raise_for_status()
-        data = response.json()
+        data = response.json()['data']
         if isinstance(data, list) and data and isinstance(data[0], dict) and 'embedding' in data[0]:
-            embedding = np.array(data[0]['embedding'][0], dtype=np.float32)
+            embedding = np.array(data[0]['embedding'], dtype=np.float32)
             return normalize_l2(embedding).tolist()
         else:
             print(f"error: unexpected response format: {str(data)[:200]}...")
             return None
-    except requests.exceptions.RequestException as e:
+    except httpx.RequestError as e:
         print(f"error connecting to the embedding server: {e}")
         return None
 
-def get_vader_sentiment_label(word: str, sia: SentimentIntensityAnalyzer) -> str:
-    score = sia.polarity_scores(word)['compound']
+async def get_vader_sentiment_label(word: str, sia: SentimentIntensityAnalyzer) -> str:
+    scores = await asyncio.to_thread(sia.polarity_scores, word)
+    score = scores['compound']
     if score >= 0.05: return "positive"
     elif score <= -0.05: return "negative"
     else: return "neutral"
@@ -83,7 +110,7 @@ def get_simple_pos(pos):
     if pos == 'r': return 'adverb';
     return 'other'
 
-def perform_single_search(query_word: str, mode: str, pos_list: list, top_k: int, sia: SentimentIntensityAnalyzer) -> (list, str):
+async def perform_single_search(query_word: str, mode: str, pos_list: list, top_k: int, sia: SentimentIntensityAnalyzer) -> (list, str):
     try:
         query_definition = None
 
@@ -102,14 +129,14 @@ def perform_single_search(query_word: str, mode: str, pos_list: list, top_k: int
 
         if not query_definition:
             definition_mode = "antonym" if mode == "antonym" else "synonym"
-            query_definition = generate_query_definition(query_word, definition_mode)
+            query_definition = await generate_query_definition(query_word, definition_mode)
 
         if not query_definition: return None, f"couldnt gen def from wordnet or LLM for: {query_word}."
-        query_vector = get_query_embedding(query_definition)
-        if not query_vector: return None, f"cailed gen embedding for def of: {query_word}."
+        query_vector = await get_query_embedding(query_definition)
+        if not query_vector: return None, f"failed gen embedding for def of: {query_word}."
 
         must_conditions = []
-        query_word_sentiment = get_vader_sentiment_label(query_word, sia)
+        query_word_sentiment = await get_vader_sentiment_label(query_word, sia)
 
         if mode == "synonym":
             if query_word_sentiment == "positive": must_conditions.append(models.FieldCondition(key="sentiment_score", range=models.Range(gte=0.05)))
@@ -122,7 +149,7 @@ def perform_single_search(query_word: str, mode: str, pos_list: list, top_k: int
             must_conditions.append(models.FieldCondition(key="pos", match=models.MatchAny(any=pos_list)))
 
         query_filter = models.Filter(must=must_conditions) if must_conditions else None
-        search_results = qdrant_client.search(
+        search_results = await qdrant_client.search(
             collection_name=qdrant_collection, query_vector=query_vector,
             query_filter=query_filter, limit=max(top_k*2,20)
         )
@@ -132,6 +159,7 @@ def perform_single_search(query_word: str, mode: str, pos_list: list, top_k: int
         return distinct_results[:top_k], None
     except Exception as e:
         print(f"error during {mode} search for {query_word}: {e}")
+        print(traceback.format_exc())
         return None, "internal error of some kind"
 
 def lerp(start, end, t):
@@ -231,8 +259,14 @@ def filter_distinct_results(raw_hits: list, query_phrase: str) -> list:
             best_hits[word] = hit
     return list(best_hits.values())
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 try:
     nltk.data.find('sentiment/vader_lexicon.zip')
@@ -242,28 +276,25 @@ except LookupError:
     print("error: NLTK VADER lexicon not found")
     SIA = None
 
-@app.route("/search", methods=["GET"])
-def search():
-    if not SIA: return jsonify({"error": "NLTK VADER lexicon not initialized on server."}), 500
+@app.get("/search")
+async def search(width: int, height: int, phrase: str = "angry", mode: str = "search", n: int = 10, pos: list[int] = Query(None)):
+    if not SIA: return JSONResponse({"error": "NLTK VADER lexicon not initialized on server."}, 500)
 
-    query_phrase = request.args.get("phrase", "angry")
-    mode = request.args.get("mode", "search")
-    top_k = request.args.get("n", default=10, type=int)
-    pos_list = request.args.getlist("pos")
-    width = request.args.get("width", type=int)
-    height = request.args.get("height", type=int)
+    query_phrase = phrase
+    top_k = n
+    pos_list = pos
 
-    if not width: return jsonify({"error": "i demand a width."}), 400
-    if not height: return jsonify({"error": "i demand a height."}), 400
+    if not width: return JSONResponse({"error": "i demand a width."}, 400)
+    if not height: return JSONResponse({"error": "i demand a height."}, 400)
 
     raw_synonyms, raw_antonyms = [], []
     if mode == "synonym" or mode == "search":
-        presults, error = perform_single_search(query_phrase, "synonym", pos_list, top_k, SIA)
-        if error: return jsonify({"error": f"died on synonym search: {error}"}), 500
+        presults, error = await perform_single_search(query_phrase, "synonym", pos_list, top_k, SIA)
+        if error: return JSONResponse({"error": f"died on synonym search: {error}"}, 500)
         if presults: raw_synonyms = presults
     if mode == "antonym" or mode == "search":
-        presults, error = perform_single_search(query_phrase, "antonym", pos_list, top_k, SIA)
-        if error: return jsonify({"error": f"died on antonym search: {error}"}), 500
+        presults, error = await perform_single_search(query_phrase, "antonym", pos_list, top_k, SIA)
+        if error: return JSONResponse({"error": f"died on antonym search: {error}"}, 500)
         if presults: raw_antonyms = presults
 
     processed_synonyms = normalize_and_process_results(raw_synonyms, "synonym", width, height)
@@ -271,22 +302,7 @@ def search():
 
     results = processed_synonyms + processed_antonyms
 
-    return jsonify({"results": results})
+    return JSONResponse({"results": results})
 
 if __name__ == "__main__":
-    api_key = os.getenv("QDRANT_API_KEY")
-    if not api_key:
-        raise ValueError("QDRANT_API_KEY envvar not set")
-
-    qdrant_host = os.getenv("QDRANT_HOST")
-    if not qdrant_host:
-        raise ValueError("QDRANT_HOST envvar not set")
-
-    qdrant_client = QdrantClient(
-        host=qdrant_host,
-        port=qdrant_port,
-        api_key=api_key,
-        https=False
-    )
-
-    app.run(debug=True, port=5000)
+    uvicorn.run("api:app", port=5000, host="0.0.0.0")
