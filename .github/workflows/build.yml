@@ -30,3 +30,4 @@ jobs:
           file: Containerfile
           push: true
           tags: ghcr.io/thaisaurus/api:latest
+          platforms: linux/amd64,linux/arm64
