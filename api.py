@@ -5,6 +5,7 @@ from qdrant_client import AsyncQdrantClient, models
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from nltk.corpus import wordnet as wn
+from nltk.stem import WordNetLemmatizer
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -151,12 +152,10 @@ async def perform_single_search(query_word: str, mode: str, pos_list: list, top_
         query_filter = models.Filter(must=must_conditions) if must_conditions else None
         search_results = await qdrant_client.search(
             collection_name=qdrant_collection, query_vector=query_vector,
-            query_filter=query_filter, limit=max(top_k*2,20)
+            query_filter=query_filter, limit=max(top_k*3,20)
         )
 
-        distinct_results = filter_distinct_results(search_results, query_word)
-
-        return distinct_results[:top_k], None
+        return search_results, None
     except Exception as e:
         print(f"error during {mode} search for {query_word}: {e}")
         print(traceback.format_exc())
@@ -248,16 +247,54 @@ def normalize_and_process_results(raw_hits: list, mode: str, width: int, height:
 
     return processed_results
 
-def filter_distinct_results(raw_hits: list, query_phrase: str) -> list:
-    best_hits = {}
+def get_wordnet_pos(pos: str):
+    if pos == 'noun': return wn.NOUN
+    if pos == 'verb': return wn.VERB
+    if pos == 'adjective': return wn.ADJ
+    if pos == 'adverb': return wn.ADV
+    return wn.NOUN
+
+def filter_distinct_results(raw_hits: list, query_phrase: str, lemmatizer: WordNetLemmatizer) -> list:
+    if not raw_hits:
+        return []
+
+    exclusion_set = set()
     clean_query_phrase = query_phrase.strip().lower()
+
+    exclusion_set.add(clean_query_phrase)
+
+    for synset in wn.synsets(clean_query_phrase):
+        for lemma in synset.lemmas():
+            exclusion_set.add(lemma.name().lower())
+            for related_form in lemma.derivationally_related_forms():
+                exclusion_set.add(related_form.name().lower())
+
+    for word_root in list(exclusion_set):
+        exclusion_set.add(word_root + "s")
+        exclusion_set.add(word_root + "es")
+        if word_root.endswith('y'):
+             exclusion_set.add(word_root[:-1] + "ily")
+        else:
+             exclusion_set.add(word_root + "ly")
+        exclusion_set.add(word_root + "ness")
+        exclusion_set.add(word_root + "er")
+        exclusion_set.add(word_root + "est")
+
+    best_hits_by_lemma = {}
+
     for hit in raw_hits:
         word = hit.payload.get("word", "").strip().lower()
-        if not word or word == clean_query_phrase:
+
+        if not word or word in exclusion_set:
             continue
-        if word not in best_hits or hit.score > best_hits[word].score:
-            best_hits[word] = hit
-    return list(best_hits.values())
+
+        pos_tag = get_wordnet_pos(hit.payload.get("pos", "noun"))
+        lemma = lemmatizer.lemmatize(word, pos=pos_tag)
+
+        if lemma not in best_hits_by_lemma:
+            best_hits_by_lemma[lemma] = hit
+
+    return list(best_hits_by_lemma.values())
 
 app = FastAPI()
 app.add_middleware(
@@ -272,6 +309,7 @@ try:
     nltk.data.find('sentiment/vader_lexicon.zip')
     nltk.data.find('corpora/wordnet.zip')
     SIA = SentimentIntensityAnalyzer()
+    LEMMATIZER = WordNetLemmatizer()
 except LookupError:
     print("error: NLTK VADER lexicon not found")
     SIA = None
@@ -297,8 +335,15 @@ async def search(width: int, height: int, phrase: str = "angry", mode: str = "se
         if error: return JSONResponse({"error": f"died on antonym search: {error}"}, 500)
         if presults: raw_antonyms = presults
 
-    processed_synonyms = normalize_and_process_results(raw_synonyms, "synonym", width, height)
-    processed_antonyms = normalize_and_process_results(raw_antonyms, "antonym", width, height)
+    raw_hits = raw_synonyms + raw_antonyms
+    distinct_hits = filter_distinct_results(raw_hits, query_phrase, LEMMATIZER)
+    final_hits = distinct_hits[:top_k]
+
+    final_synonyms = [h for h in final_hits if h.id in {hit.id for hit in raw_synonyms}]
+    final_antonyms = [h for h in final_hits if h.id in {hit.id for hit in raw_antonyms}]
+
+    processed_synonyms = normalize_and_process_results(final_synonyms, "synonym", width, height)
+    processed_antonyms = normalize_and_process_results(final_antonyms, "antonym", width, height)
 
     results = processed_synonyms + processed_antonyms
 
