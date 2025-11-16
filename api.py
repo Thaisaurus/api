@@ -338,11 +338,11 @@ async def search(width: int, height: int, phrase: str = "angry", mode: str = "se
     raw_hits = raw_synonyms + raw_antonyms
     distinct_hits = filter_distinct_results(raw_hits, query_phrase, LEMMATIZER)
 
-    final_synonyms = [h for h in distinct_hits if h.id in {hit.id for hit in raw_synonyms}]
-    final_antonyms = [h for h in distinct_hits if h.id in {hit.id for hit in raw_antonyms}]
+    final_synonyms = [h for h in distinct_hits if h.id in {hit.id for hit in raw_synonyms}][:top_k]
+    final_antonyms = [h for h in distinct_hits if h.id in {hit.id for hit in raw_antonyms}][:top_k]
 
-    processed_synonyms = normalize_and_process_results(final_synonyms, "synonym", width, height)[:top_k]
-    processed_antonyms = normalize_and_process_results(final_antonyms, "antonym", width, height)[:top_k]
+    processed_synonyms = normalize_and_process_results(final_synonyms, "synonym", width, height)
+    processed_antonyms = normalize_and_process_results(final_antonyms, "antonym", width, height)
 
     results = processed_synonyms + processed_antonyms
 
@@ -350,4 +350,5 @@ async def search(width: int, height: int, phrase: str = "angry", mode: str = "se
 
 if __name__ == "__main__":
     uvicorn.run("api:app", port=5000, host="0.0.0.0")
+
 
