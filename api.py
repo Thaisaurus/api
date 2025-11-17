@@ -258,43 +258,65 @@ def filter_distinct_results(raw_hits: list, query_phrase: str, lemmatizer: WordN
     if not raw_hits:
         return []
 
-    exclusion_set = set()
-    clean_query_phrase = query_phrase.strip().lower()
+    seen_roots = set()
 
-    exclusion_set.add(clean_query_phrase)
+    clean_query = query_phrase.strip().lower()
+    seen_roots.add(lemmatizer.lemmatize(clean_query, pos=wn.NOUN))
+    seen_roots.add(lemmatizer.lemmatize(clean_query, pos=wn.VERB))
+    try:
+        for synset in wn.synsets(clean_query):
+            for lemma in synset.lemmas():
+                seen_roots.add(lemma.name().lower())
+                for related_form in lemma.derivationally_related_forms():
+                    seen_roots.add(related_form.name().lower())
+    except Exception:
+        pass
 
-    for synset in wn.synsets(clean_query_phrase):
-        for lemma in synset.lemmas():
-            exclusion_set.add(lemma.name().lower())
-            for related_form in lemma.derivationally_related_forms():
-                exclusion_set.add(related_form.name().lower())
-
-    for word_root in list(exclusion_set):
-        exclusion_set.add(word_root + "s")
-        exclusion_set.add(word_root + "es")
-        if word_root.endswith('y'):
-             exclusion_set.add(word_root[:-1] + "ily")
-        else:
-             exclusion_set.add(word_root + "ly")
-        exclusion_set.add(word_root + "ness")
-        exclusion_set.add(word_root + "er")
-        exclusion_set.add(word_root + "est")
-
-    best_hits_by_lemma = {}
-
+    
+    final_hits = []
     for hit in raw_hits:
         word = hit.payload.get("word", "").strip().lower()
-
-        if not word or word in exclusion_set:
+        if not word:
             continue
 
         pos_tag = get_wordnet_pos(hit.payload.get("pos", "noun"))
         lemma = lemmatizer.lemmatize(word, pos=pos_tag)
 
-        if lemma not in best_hits_by_lemma:
-            best_hits_by_lemma[lemma] = hit
+        if lemma in seen_roots:
+            continue
 
-    return list(best_hits_by_lemma.values())
+        is_new_root = True
+        try:
+            for synset in wn.synsets(word):
+                for lem in synset.lemmas():
+                    if lem.name().lower() in seen_roots:
+                        is_new_root = False
+                        break
+                    for related in lem.derivationally_related_forms():
+                        if related.name().lower() in seen_roots:
+                            is_new_root = False
+                            break
+                if not is_new_root:
+                    break
+        except Exception:
+            pass
+
+        if not is_new_root:
+            continue
+
+        final_hits.append(hit)
+
+        seen_roots.add(lemma)
+        try:
+            for synset in wn.synsets(word):
+                for lem in synset.lemmas():
+                    seen_roots.add(lem.name().lower())
+                    for related in lem.derivationally_related_forms():
+                        seen_roots.add(related.name().lower())
+        except Exception:
+            pass
+
+    return final_hits
 
 app = FastAPI()
 app.add_middleware(
@@ -350,5 +372,6 @@ async def search(width: int, height: int, phrase: str = "angry", mode: str = "se
 
 if __name__ == "__main__":
     uvicorn.run("api:app", port=5000, host="0.0.0.0")
+
 
 
