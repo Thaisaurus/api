@@ -347,15 +347,32 @@ async def search(width: int, height: int, phrase: str = "angry", mode: str = "se
     if not width: return JSONResponse({"error": "i demand a width."}, 400)
     if not height: return JSONResponse({"error": "i demand a height."}, 400)
 
-    raw_synonyms, raw_antonyms = [], []
+    tasks = []
+    # raw_synonyms, raw_antonyms = [], []
     if mode == "synonym" or mode == "search":
-        presults, error = await perform_single_search(query_phrase, "synonym", pos_list, top_k, SIA)
-        if error: return JSONResponse({"error": f"died on synonym search: {error}"}, 500)
-        if presults: raw_synonyms = presults
+        tasks.append(perform_single_search(query_phrase, "synonym", pos_list, top_k, SIA))
+        # presults, error = await perform_single_search(query_phrase, "synonym", pos_list, top_k, SIA)
+        # if error: return JSONResponse({"error": f"died on synonym search: {error}"}, 500)
+        # if presults: raw_synonyms = presults
+    else:
+        tasks.append(asyncio.sleep(0))
     if mode == "antonym" or mode == "search":
-        presults, error = await perform_single_search(query_phrase, "antonym", pos_list, top_k, SIA)
-        if error: return JSONResponse({"error": f"died on antonym search: {error}"}, 500)
-        if presults: raw_antonyms = presults
+        tasks.append(perform_single_search(query_phrase, "antonym", pos_list, top_k, SIA))
+        # presults, error = await perform_single_search(query_phrase, "antonym", pos_list, top_k, SIA)
+        # if error: return JSONResponse({"error": f"died on antonym search: {error}"}, 500)
+        # if presults: raw_antonyms = presults
+    else:
+        tasks.append(asyncio.sleep(0))
+
+    synonym_res, antonym_res = await asyncio.gather(*tasks)
+
+    raw_synonyms, error = synonym_res
+    if error:
+        return JSONResponse({"error": f"died on synonym search: {error}"}, 500)
+
+    raw_antonyms, error = antonym_res
+    if error:
+        return JSONResponse({"error": f"died on antonym search: {error}"}, 500)
 
     raw_hits = raw_synonyms + raw_antonyms
     distinct_hits = filter_distinct_results(raw_hits, query_phrase, LEMMATIZER)
